@@ -26,6 +26,7 @@ local getTplBuf, getTplDelayBuf, applyTplVars, stripColorTags,
 local menu_open = imgui.new.bool(false)
 local buy_config_modal_open = imgui.new.bool(false)
 local menu_alpha = 0.0
+local last_ui_scale = 1.0
 
 function animateMenuFade(target_open)
     local start_alpha = menu_alpha
@@ -570,6 +571,14 @@ imgui.OnFrame(
     function(this)
         local io = imgui.GetIO()
         local sw, sh = getScreenResolution()
+
+        local ui_scale = math.min(1.0, (sh * 0.88) / 1020)
+        if ui_scale < 0.55 then ui_scale = 0.55 end
+        if ui_scale ~= last_ui_scale then
+            imgui.GetStyle():ScaleAllSizes(ui_scale / last_ui_scale)
+            last_ui_scale = ui_scale
+        end
+        io.FontGlobalScale = ui_scale
         
         local win_w = sw * 0.98
         local win_h = sh * 0.90
@@ -741,7 +750,7 @@ imgui.OnFrame(
 
         imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, menu_alpha)
         local fixed_w = math.min(sw * 0.92, 1500)
-        local fixed_h = math.max(950, math.min(sh * 0.88, 1020))
+        local fixed_h = math.min(sh * 0.88, 1020)
         if CM_WinCenterX == nil then CM_WinCenterX, CM_WinCenterY = sw / 2, sh / 2 end
         imgui.SetNextWindowPos(imgui.ImVec2(CM_WinCenterX, CM_WinCenterY), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
         imgui.SetNextWindowSize(imgui.ImVec2(fixed_w, fixed_h), imgui.Cond.Always)
@@ -1464,19 +1473,14 @@ imgui.OnFrame(
             local rounding = 18.0
             local p_max = imgui.ImVec2(p.x + FLOAT_BTN_W, p.y + FLOAT_BTN_H)
 
-            -- тень под кнопкой
             dl:AddRectFilled(imgui.ImVec2(p.x + 2, p.y + 5), imgui.ImVec2(p_max.x + 2, p_max.y + 6), imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0,0,0,0.40)), rounding)
 
-            -- ровная скруглённая заливка (без градиента, чтобы углы не резались)
             dl:AddRectFilled(p, p_max, imgui.ColorConvertFloat4ToU32(fill_col), rounding)
 
-            -- лёгкое затемнение снизу для объёма (инсет, не задевает углы)
             dl:AddRectFilled(imgui.ImVec2(p.x + 3, p.y + FLOAT_BTN_H * 0.55), imgui.ImVec2(p_max.x - 3, p_max.y - 3), imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0,0,0,0.12)), rounding * 0.5)
 
-            -- обводка
             dl:AddRect(p, p_max, imgui.ColorConvertFloat4ToU32(border_dark), rounding, 15, 2.0)
 
-            -- блик сверху (инсет, не задевает углы)
             dl:AddRectFilled(imgui.ImVec2(p.x + 10, p.y + 4), imgui.ImVec2(p_max.x - 10, p.y + FLOAT_BTN_H * 0.32), imgui.ColorConvertFloat4ToU32(shine), 10.0)
 
             local function drawOutlinedText(font, text, x, y, col)
