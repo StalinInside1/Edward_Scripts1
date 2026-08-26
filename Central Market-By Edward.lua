@@ -1,9 +1,11 @@
 script_name("Central Market")
-script_version("1.4")
+script_version("1.1")
+script_author("By Edward")
 
 require 'lib.moonloader'
 local ffi = require 'ffi'
 local lfs = require 'lfs'
+local androidEnvUtil = require('android.jnienv-util')
 local cjson = require 'cjson'
 local encoding = require 'encoding'
 encoding.default = 'CP1251'
@@ -22,6 +24,26 @@ local getTplBuf, getTplDelayBuf, applyTplVars, stripColorTags,
 
 
 local menu_open = imgui.new.bool(false)
+local buy_config_modal_open = imgui.new.bool(false)
+local menu_alpha = 0.0
+
+function animateMenuFade(target_open)
+    local start_alpha = menu_alpha
+    local start_time = os.clock()
+    local duration = 0.22
+    lua_thread.create(function()
+        while true do
+            wait(0)
+            local t = (os.clock() - start_time) / duration
+            if t < 0 then t = 0 end
+            if t > 1 then t = 1 end
+            local target_alpha = target_open and 1.0 or 0.0
+            menu_alpha = start_alpha + (target_alpha - start_alpha) * t
+            if t >= 1 then break end
+        end
+        menu_alpha = target_open and 1.0 or 0.0
+    end)
+end
 local drag_scroll = { left_down = false, left_y = 0, right_down = false, right_y = 0, settings_down = false, settings_y = 0 }
 local current_tab = 1
 
@@ -43,10 +65,6 @@ local RunState = {
 
 local tpl_bufs = {}
 local tpl_delay_bufs = {}
-
-
-
-
 
 local QUALITY_TAGS = {
     "Улучшение оружия", "Унив. тюнинг", "Виз. тюнинг", "Тех. тюнинг", "Авто. номер",
@@ -95,6 +113,7 @@ local FILE_NAMES = ROOT_DIR .. 'data/cm_items_db.json'
 local FILE_CFG_SELL = ROOT_DIR .. 'cm_config_sell.json'
 local FILE_CFG_BUY = ROOT_DIR .. 'cm_config_buy.json'
 local FILE_SETTINGS = ROOT_DIR .. 'cm_settings.json'
+local FILE_BUY_PROFILES = ROOT_DIR .. 'cm_buy_profiles.json'
 
 local Prefs = {
     auto_name = false,
@@ -148,6 +167,9 @@ end
 
 local sell_cfg = readJsonFromDisk(FILE_CFG_SELL)
 local buy_cfg = readJsonFromDisk(FILE_CFG_BUY)
+local buy_profiles = readJsonFromDisk(FILE_BUY_PROFILES)
+local selected_buy_profile = nil
+local buy_profile_name_buf = ffi.new('char[64]')
 
 local loaded_sets = readJsonFromDisk(FILE_SETTINGS)
 if loaded_sets.auto_name ~= nil then Prefs.auto_name = loaded_sets.auto_name end
@@ -170,13 +192,6 @@ local b_float_btn_move_mode = imgui.new.bool(false)
 local i_debug_subid = imgui.new.int(8)
 local b_debug_flag = imgui.new.bool(false)
 
-
-
-
-
-
-
-
 stock_items = readJsonFromDisk(FILE_INVENTORY)
 catalog_items = readJsonFromDisk(FILE_CATALOG)
 local raw_names = readJsonFromDisk(FILE_NAMES)
@@ -185,11 +200,6 @@ if raw_names then
         name_lookup[tostring(k)] = type(v) == "table" and v.n or v
     end
 end
-
-
-
-
-
 
 function events.onShowDialog(id, style, title, b1, b2, text)
     local clean_title = stripColorTags(title)
@@ -432,13 +442,35 @@ function events.onShowDialog(id, style, title, b1, b2, text)
     end
 end
 
+local lastInteractPromptId = nil
+local lastInteractTime = 0
+local lastSeenInteractPromptId = nil
+
+function sendMarketInteract(promptId)
+    if promptId == lastInteractPromptId and (os.clock() - lastInteractTime) < 2 then
+        return
+    end
+    lastInteractPromptId = promptId
+    lastInteractTime = os.clock()
+
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 63)
+    raknetBitStreamWriteInt8(bs, 8)
+    raknetBitStreamWriteInt32(bs, 7)
+    raknetBitStreamWriteInt32(bs, promptId)
+    raknetBitStreamWriteInt16(bs, 0)
+    raknetSendBitStreamEx(bs, 1, 7, 0)
+    raknetDeleteBitStream(bs)
+end
+
 addEventHandler('onReceivePacket', function(id, bs)
     if id == 220 then
         local saved_offset = raknetBitStreamGetReadOffset(bs)
         raknetBitStreamIgnoreBits(bs, 8)
         local pType = raknetBitStreamReadInt8(bs)
         
-        if pType == 84 and (RunState.inventory_scan.active or RunState.buying_scan.active or RunState.selling.active) then
+        if pType == 84 then
             local interfaceid = raknetBitStreamReadInt8(bs)
             local subid = raknetBitStreamReadInt8(bs)
             local len = raknetBitStreamReadInt16(bs) 
@@ -454,7 +486,22 @@ addEventHandler('onReceivePacket', function(id, bs)
             
             if ok and type(json_str) == "string" and json_str ~= "" then
                 json_str = json_str:gsub("%z", "")
-                parseMobileCEF(interfaceid, json_str)
+
+                local automation_active = RunState.inventory_scan.active or RunState.buying_scan.active or RunState.selling.active or RunState.buying.active
+
+                if interfaceid == 8 and subid == 18 then
+                    local pok, pdata = pcall(cjson.decode, json_str)
+                    if pok and type(pdata) == "table" and pdata.id then
+                        lastSeenInteractPromptId = pdata.id
+                        if automation_active then
+                            sendMarketInteract(pdata.id)
+                        end
+                    end
+                end
+
+                if automation_active then
+                    parseMobileCEF(interfaceid, json_str)
+                end
             end
         end
         
@@ -518,11 +565,8 @@ imgui.OnInitialize(function()
     fnt_icons_lg = io.Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 40.0, large_icon_config, fa_ranges)
 end)
 
-
-
-
 imgui.OnFrame(
-    function() return menu_open[0] or RunState.inventory_scan.active or RunState.buying_scan.active or RunState.selling.active or RunState.buying.active end,
+    function() return menu_open[0] or menu_alpha > 0.001 or RunState.inventory_scan.active or RunState.buying_scan.active or RunState.selling.active or RunState.buying.active end,
     function(this)
         local io = imgui.GetIO()
         local sw, sh = getScreenResolution()
@@ -695,8 +739,11 @@ imgui.OnFrame(
             if not menu_open[0] then return end
         end
 
-        local fixed_w, fixed_h = 1500, 1020
-        imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+        imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, menu_alpha)
+        local fixed_w = math.min(sw * 0.92, 1500)
+        local fixed_h = math.max(950, math.min(sh * 0.88, 1020))
+        if CM_WinCenterX == nil then CM_WinCenterX, CM_WinCenterY = sw / 2, sh / 2 end
+        imgui.SetNextWindowPos(imgui.ImVec2(CM_WinCenterX, CM_WinCenterY), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
         imgui.SetNextWindowSize(imgui.ImVec2(fixed_w, fixed_h), imgui.Cond.Always)
         local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar
 
@@ -712,6 +759,15 @@ imgui.OnFrame(
             imgui.PushFont(fnt_main)
 
             local window_width = imgui.GetWindowWidth()
+
+            imgui.SetCursorPos(imgui.ImVec2(0, 0))
+            imgui.InvisibleButton("##cm_drag_handle", imgui.ImVec2(window_width - 62, 60))
+            if imgui.IsItemActive() and imgui.IsMouseDragging(0) then
+                local mdelta = imgui.GetIO().MouseDelta
+                CM_WinCenterX = CM_WinCenterX + mdelta.x
+                CM_WinCenterY = CM_WinCenterY + mdelta.y
+            end
+
             imgui.SetCursorPosX(window_width - 62)
             imgui.SetCursorPosY(8)
             if imgui.Button("X##close_main", imgui.ImVec2(52, 52)) then
@@ -743,25 +799,25 @@ imgui.OnFrame(
             imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.10, 0.50, 0.72, 1.0))
             if imgui.Button(u8"Telegram", imgui.ImVec2(tab_btn_w, 58)) then
                 local tg_url = "https://t.me/edward_scripts"
-                local opened = false
 
-                local variants = {
-                    function() return os.execute('explorer ' .. tg_url) end,
-                    function() return os.execute('start ' .. tg_url) end,
-                    function() return os.execute(tg_url) end,
-                    function() return io.popen('explorer ' .. tg_url) end,
-                }
-                for _, try_fn in ipairs(variants) do
-                    local ok, res = pcall(try_fn)
-                    if ok and res then opened = true end
+                local opened = pcall(function()
+                    local env = require("android.jnienv")
+                    local urlStr = env.NewStringUTF(tg_url)
+                    local uri = androidEnvUtil.CallStaticObjectMethod("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", urlStr)
+                    local actionView = androidEnvUtil.GetStaticObjectField("android/content/Intent", "ACTION_VIEW", "Ljava/lang/String;")
+                    local intent = androidEnvUtil.CallConstructor("android/content/Intent", "(Ljava/lang/String;Landroid/net/Uri;)V", actionView, uri)
+                    androidEnvUtil.CallVoidMethod(require("android.jni-raw").activity, "startActivity", "(Landroid/content/Intent;)V", intent)
+                end)
+
+                if opened then
+                    sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Открываю Telegram...", -1)
+                else
+                    if type(setClipboardText) == "function" then
+                        pcall(setClipboardText, tg_url)
+                    end
+                    sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Telegram: {00FFFF}" .. tg_url, -1)
+                    sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Ссылка скопирована в буфер обмена, вставьте её в браузер/Telegram", -1)
                 end
-
-                if type(setClipboardText) == "function" then
-                    pcall(setClipboardText, tg_url)
-                end
-
-                sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Telegram: {00FFFF}" .. tg_url, -1)
-                sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Ссылка скопирована в буфер обмена, вставьте её в браузер/Telegram", -1)
             end
             imgui.PopStyleColor(3)
             imgui.SameLine()
@@ -784,6 +840,7 @@ imgui.OnFrame(
                     else
                         RunState.buying_scan = {active=true, stage='waiting_dialog', current_page=1, all_items={}, current_dialog_id=nil}
                         watchShopProximity(function() return RunState.buying_scan end)
+                        if lastSeenInteractPromptId then sendMarketInteract(lastSeenInteractPromptId) end
                         sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Подойдите к лавке и нажмите кнопку взаимодействия!", -1)
                         menu_open[0] = false
                     end
@@ -808,14 +865,23 @@ imgui.OnFrame(
                             if is_sell then
                                 RunState.selling = { active = true, stage = 'waiting_dialog', current_idx = 1, total = #sell_cfg, current_item = nil }
                                 watchShopProximity(function() return RunState.selling end)
+                                if lastSeenInteractPromptId then sendMarketInteract(lastSeenInteractPromptId) end
                                 sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Откройте лавку для автоматической продажи!", -1)
                             else
                                 RunState.buying = { active = true, stage = 'waiting_dialog', current_idx = 1, total = #buy_cfg, current_item = nil }
                                 watchShopProximity(function() return RunState.buying end)
+                                if lastSeenInteractPromptId then sendMarketInteract(lastSeenInteractPromptId) end
                                 sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Откройте лавку для автоматической скупки!", -1)
                             end
                             menu_open[0] = false
                         end
+                    end
+                end
+
+                if not is_sell then
+                    imgui.SameLine()
+                    if imgui.Button(u8"Конфиги##openbuyconfigs", imgui.ImVec2(180, 52)) then
+                        buy_config_modal_open[0] = true
                     end
                 end
 
@@ -824,7 +890,7 @@ imgui.OnFrame(
                 imgui.InputTextWithHint("##search_left", u8"Введите название товара для поиска...", search_buf, 256)
                 imgui.PopItemWidth()
                 imgui.SameLine()
-                if imgui.Button(u8"Стереть", imgui.ImVec2(115, 40)) then
+                if imgui.Button("X##clear_left", imgui.ImVec2(40, 40)) then
                     ffi.fill(search_buf, ffi.sizeof(search_buf))
                 end
                 imgui.SameLine()
@@ -847,9 +913,10 @@ imgui.OnFrame(
 
                 imgui.Columns(2, "TradeColumnsFB", false)
                 imgui.SetColumnWidth(0, 630)
+                local list_area_h = math.max(300, imgui.GetContentRegionAvail().y - 10)
                 imgui.Text(u8"Доступные товары:")
                 local left_child_id = is_sell and "LeftListFB_sell" or "LeftListFB_buy"
-                if imgui.BeginChild(left_child_id, imgui.ImVec2(610, 680), true) then
+                if imgui.BeginChild(left_child_id, imgui.ImVec2(610, list_area_h), true) then
                     local wheel = imgui.GetIO().MouseWheel
                     if wheel ~= 0 and imgui.IsWindowHovered() then imgui.SetScrollY(imgui.GetScrollY() - wheel * 45) end
                     local mp_l = imgui.GetIO().MousePos
@@ -885,7 +952,7 @@ imgui.OnFrame(
                     if total_f > 0 then
                         local row_h = imgui.GetTextLineHeightWithSpacing() + 4
                         local scroll_y = imgui.GetScrollY()
-                        local view_h = 680
+                        local view_h = list_area_h
                         local first = math.max(1, math.floor(scroll_y / row_h) - 3)
                         local last = math.min(total_f, math.ceil((scroll_y + view_h) / row_h) + 3)
 
@@ -930,10 +997,39 @@ imgui.OnFrame(
 
                 imgui.NextColumn()
                 imgui.Text(is_sell and u8"Список для продажи:" or u8"Список для скупки:")
+                if is_sell then
+                    imgui.SameLine()
+                    if imgui.Button(u8"Добавить всё##addall", imgui.ImVec2(200, 36)) then
+                        for _, item in ipairs(source_items) do
+                            local already_added = false
+                            for _, v in ipairs(target_config) do
+                                if v.name == item.name then already_added = true break end
+                            end
+                            if not already_added then
+                                table.insert(target_config, {
+                                    name = item.name,
+                                    model_id = item.model_id or item.index,
+                                    amount = item.max_amount or 1,
+                                    max_amount = item.max_amount,
+                                    price = 1000,
+                                    use_max = false
+                                })
+                            end
+                        end
+                        writeJsonToDisk(cfg_path, target_config)
+                        qty_bufs_sell = {} cost_bufs_sell = {}
+                    end
+                end
+                imgui.SameLine()
+                if imgui.Button(u8"Очистить всё##clearall", imgui.ImVec2(200, 36)) then
+                    for k in pairs(target_config) do target_config[k] = nil end
+                    writeJsonToDisk(cfg_path, target_config)
+                    if is_sell then qty_bufs_sell = {} cost_bufs_sell = {} else qty_bufs_buy = {} cost_bufs_buy = {} end
+                end
                 local right_child_id = is_sell and "RightListFB_sell" or "RightListFB_buy"
                 local avail_r = imgui.GetContentRegionAvail()
                 local right_child_w = math.max(740, avail_r.x - 8)
-                if imgui.BeginChild(right_child_id, imgui.ImVec2(right_child_w, 680), true) then
+                if imgui.BeginChild(right_child_id, imgui.ImVec2(right_child_w, list_area_h), true) then
                     local wheel_r = imgui.GetIO().MouseWheel
                     if wheel_r ~= 0 and imgui.IsWindowHovered() then imgui.SetScrollY(imgui.GetScrollY() - wheel_r * 45) end
                     local mp_r = imgui.GetIO().MousePos
@@ -981,7 +1077,7 @@ imgui.OnFrame(
 
                     if is_sell then
                         imgui.SetCursorPosX(COL_M_X)
-                        imgui.TextColored(Palette.text_secondary, u8"Макс")
+                        imgui.TextColored(Palette.text_secondary, u8"")
                     end
                     imgui.SetCursorPosX(COL_AMT_X)
                     imgui.TextColored(Palette.text_secondary, u8"Кол-во")
@@ -1070,13 +1166,13 @@ imgui.OnFrame(
                 imgui.Spacing()
 
                 imgui.TextColored(Palette.accent_primary, u8"Автоматизация имени")
-                if imgui.Checkbox(u8"Автогенерация имени магазина##fbautoname", b_auto_name) then
+                if imgui.Checkbox(u8"Авто-выставление названия лавки##fbautoname", b_auto_name) then
                     Prefs.auto_name = b_auto_name[0]
                     writeJsonToDisk(FILE_SETTINGS, Prefs)
                 end
                 imgui.Spacing()
 
-                imgui.TextColored(Palette.text_secondary, u8"Название вашего магазина:")
+                imgui.TextColored(Palette.text_secondary, u8"Название вашей лавки:")
                 imgui.PushItemWidth(520)
                 if imgui.InputText("##shopnamefb", buf_shop_name, 64) then
                     Prefs.shop_name = ffi.string(buf_shop_name)
@@ -1132,7 +1228,8 @@ imgui.OnFrame(
                 end
 
                 imgui.Spacing()
-                if imgui.Button(u8"Сбросить позицию кнопки", imgui.ImVec2(255, 46)) then
+                local settings_btn_w = (imgui.GetContentRegionAvail().x - 10) / 2
+                if imgui.Button(u8"Сбросить позицию кнопки", imgui.ImVec2(settings_btn_w, 52)) then
                     Prefs.float_btn_x = FLOAT_BTN_DEFAULT_X
                     Prefs.float_btn_y = FLOAT_BTN_DEFAULT_Y
                     writeJsonToDisk(FILE_SETTINGS, Prefs)
@@ -1140,7 +1237,7 @@ imgui.OnFrame(
                 imgui.SameLine()
                 imgui.Dummy(imgui.ImVec2(10, 0))
                 imgui.SameLine()
-                if imgui.Button(u8"Сохранить настройки", imgui.ImVec2(255, 46)) then
+                if imgui.Button(u8"Сохранить настройки", imgui.ImVec2(settings_btn_w, 52)) then
                     Prefs.auto_name = b_auto_name[0]
                     Prefs.shop_name = ffi.string(buf_shop_name)
                     Prefs.dialog_delay = i_dialog_delay[0]
@@ -1154,29 +1251,12 @@ imgui.OnFrame(
                 imgui.Dummy(imgui.ImVec2(0, 15))
                 imgui.EndChild()
 
-                imgui.Dummy(imgui.ImVec2(0, 10))
-                imgui.Separator()
-                imgui.Spacing()
-
-                imgui.TextColored(Palette.accent_danger, u8"DEBUG: пїЅпїЅпїЅпїЅпїЅпїЅ CEF пїЅпїЅпїЅпїЅпїЅпїЅ")
-                imgui.PushItemWidth(200)
-                imgui.InputInt("##debugsubid", i_debug_subid)
-                imgui.PopItemWidth()
-                imgui.SameLine()
-                imgui.Checkbox(u8"close_flag##debugflag", b_debug_flag)
-
-                if imgui.Button(u8"пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ (66)", imgui.ImVec2(300, 46)) then
-                    sendMobileCEFPacket(i_debug_subid[0], b_debug_flag[0])
-                    sampAddChatMessage(string.format("{FF0000}| {FFFF00} Central Market {FFFFFF}Debug: sent 220,66,%d,%s", i_debug_subid[0], tostring(b_debug_flag[0])), -1)
-                end
-
-                if imgui.Button(u8"пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ", imgui.ImVec2(300, 46)) then
-                    sendMobileCEFClose()
-                end
             end
 
             imgui.Separator()
-            imgui.TextColored(Palette.accent_primary, u8"Central Market")
+            imgui.TextColored(imgui.ImVec4(0.90, 0.10, 0.10, 1.0), "By ")
+            imgui.SameLine(nil, 0)
+            imgui.TextColored(imgui.ImVec4(0.00, 1.00, 1.00, 1.0), "Edward")
 
             if current_tab == 1 or current_tab == 2 then
                 local is_sell_footer = (current_tab == 1)
@@ -1196,6 +1276,117 @@ imgui.OnFrame(
         end
         imgui.End()
         imgui.PopStyleColor(7)
+        imgui.PopStyleVar()
+
+        if buy_config_modal_open[0] and menu_open[0] then
+            local modal_w = math.min(sw * 0.55, 700)
+            local modal_h = math.min(sh * 0.75, 680)
+            if CM_ConfigCenterX == nil then CM_ConfigCenterX, CM_ConfigCenterY = sw / 2, sh / 2 end
+            imgui.SetNextWindowPos(imgui.ImVec2(CM_ConfigCenterX, CM_ConfigCenterY), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+            imgui.SetNextWindowSize(imgui.ImVec2(modal_w, modal_h), imgui.Cond.Always)
+            imgui.SetNextWindowFocus()
+            imgui.PushStyleColor(imgui.Col.WindowBg, Palette.bg_main)
+            imgui.PushStyleColor(imgui.Col.Text, Palette.text_primary)
+            imgui.PushStyleColor(imgui.Col.Border, Palette.accent_primary)
+            imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1.5)
+            local modal_flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoScrollbar
+            if imgui.Begin(u8"Конфиги скупки", buy_config_modal_open, modal_flags) then
+                local modal_win_w = imgui.GetWindowWidth()
+
+                imgui.SetCursorPos(imgui.ImVec2(0, 0))
+                imgui.InvisibleButton("##cfg_drag_handle", imgui.ImVec2(modal_win_w - 54, 46))
+                if imgui.IsItemActive() and imgui.IsMouseDragging(0) then
+                    local mdelta = imgui.GetIO().MouseDelta
+                    CM_ConfigCenterX = CM_ConfigCenterX + mdelta.x
+                    CM_ConfigCenterY = CM_ConfigCenterY + mdelta.y
+                end
+
+                imgui.SetCursorPosX(modal_win_w - 50)
+                imgui.SetCursorPosY(6)
+                if imgui.Button("X##close_buyconfigs", imgui.ImVec2(40, 40)) then
+                    buy_config_modal_open[0] = false
+                    ffi.fill(buy_profile_name_buf, ffi.sizeof(buy_profile_name_buf))
+                end
+                local modal_title = u8"Конфиги скупки"
+                local modal_title_w = imgui.CalcTextSize(modal_title).x
+                imgui.SetCursorPosX((modal_win_w - modal_title_w) / 2)
+                imgui.SetCursorPosY(10)
+                imgui.TextColored(Palette.accent_primary, modal_title)
+                imgui.Dummy(imgui.ImVec2(0, 10))
+                imgui.Separator()
+                imgui.Spacing()
+
+                imgui.TextColored(Palette.accent_primary, u8"Сохранить текущий список скупки как:")
+                imgui.PushItemWidth(-140)
+                imgui.InputTextWithHint("##newprofilename", u8"Название нового профиля...", buy_profile_name_buf, 64)
+                imgui.PopItemWidth()
+                imgui.SameLine()
+                if imgui.Button(u8"Сохранить", imgui.ImVec2(120, 40)) then
+                    local pname = ffi.string(buy_profile_name_buf)
+                    if pname ~= "" then
+                        local ok, copy = pcall(cjson.decode, cjson.encode(buy_cfg))
+                        if ok then
+                            buy_profiles[pname] = copy
+                            writeJsonToDisk(FILE_BUY_PROFILES, buy_profiles)
+                            selected_buy_profile = pname
+                            sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Профиль сохранён: " .. u8:decode(pname), -1)
+                        end
+                    end
+                end
+
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+                imgui.TextColored(Palette.accent_primary, u8"Сохранённые профили:")
+                imgui.Spacing()
+
+                local profile_names = {}
+                for name in pairs(buy_profiles) do table.insert(profile_names, name) end
+                table.sort(profile_names)
+
+                imgui.BeginChild("##BuyProfilesList", imgui.ImVec2(-1, -60), true)
+                if #profile_names == 0 then
+                    imgui.TextColored(Palette.text_secondary, u8"Пока нет сохранённых профилей")
+                end
+                for _, pname in ipairs(profile_names) do
+                    local is_sel = (pname == selected_buy_profile)
+                    if is_sel then imgui.PushStyleColor(imgui.Col.Header, Palette.accent_primary) end
+                    if imgui.Selectable(pname .. "##profsel", is_sel, nil, imgui.ImVec2(0, 34)) then
+                        selected_buy_profile = pname
+                    end
+                    if is_sel then imgui.PopStyleColor() end
+                end
+                imgui.EndChild()
+
+                imgui.Spacing()
+
+                local modal_btn_w = (imgui.GetContentRegionAvail().x - 10) / 2
+                if imgui.Button(u8"Загрузить##loadprofile", imgui.ImVec2(modal_btn_w, 44)) then
+                    if selected_buy_profile and buy_profiles[selected_buy_profile] then
+                        local ok, copy = pcall(cjson.decode, cjson.encode(buy_profiles[selected_buy_profile]))
+                        if ok and type(copy) == "table" then
+                            for k in pairs(buy_cfg) do buy_cfg[k] = nil end
+                            for i, v in ipairs(copy) do buy_cfg[i] = v end
+                            writeJsonToDisk(FILE_CFG_BUY, buy_cfg)
+                            qty_bufs_buy = {}
+                            cost_bufs_buy = {}
+                            sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Профиль загружен: " .. u8:decode(selected_buy_profile), -1)
+                        end
+                    end
+                end
+                imgui.SameLine()
+                if imgui.Button(u8"Удалить##delprofile", imgui.ImVec2(modal_btn_w, 44)) then
+                    if selected_buy_profile then
+                        buy_profiles[selected_buy_profile] = nil
+                        writeJsonToDisk(FILE_BUY_PROFILES, buy_profiles)
+                        selected_buy_profile = nil
+                    end
+                end
+            end
+            imgui.End()
+            imgui.PopStyleVar()
+            imgui.PopStyleColor(3)
+        end
     end
 )
 
@@ -1372,6 +1563,7 @@ function main()
 
         if menu_open[0] ~= prev_menu_open then
             prev_menu_open = menu_open[0]
+            animateMenuFade(menu_open[0])
         end
     end
 end
@@ -1616,18 +1808,24 @@ function processSellingCoroutine()
     end
     
     if RunState.selling.active then
-        sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Готово! Выставлено товаров: " .. items_exhibited, -1)
-        
         RunState.selling.stage = 'closing'
         sampAddChatMessage("{FF0000}| {FFFF00} Central Market {FFFFFF}Закрытие меню лавки...", -1)
         
-        local bs = raknetNewBitStream()
-        raknetBitStreamWriteInt8(bs, 220)
-        raknetBitStreamWriteInt8(bs, 66)
-        raknetBitStreamWriteInt8(bs, 60)
-        raknetBitStreamWriteBool(bs, false)
-        raknetSendBitStreamEx(bs, 1, 7, 0)
-        raknetDeleteBitStream(bs)
+        local function sendShopClosePacket(subid, flag)
+            local bs = raknetNewBitStream()
+            raknetBitStreamWriteInt8(bs, 220)
+            raknetBitStreamWriteInt8(bs, 66)
+            raknetBitStreamWriteInt8(bs, subid)
+            raknetBitStreamWriteBool(bs, flag)
+            raknetSendBitStreamEx(bs, 1, 7, 0)
+            raknetDeleteBitStream(bs)
+        end
+        
+        sendShopClosePacket(60, true)
+        wait(60)
+        sendShopClosePacket(8, false)
+        wait(60)
+        sendShopClosePacket(60, false)
         
         local wait_close = 0
         while RunState.selling.active and wait_close < 3000 do
